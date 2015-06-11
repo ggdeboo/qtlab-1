@@ -1,4 +1,4 @@
-# USB_DUX.py 
+# USB_DUX.py
 # Gabriele de Boo <ggdeboo@gmail.com>
 #
 # This program is free software; you can redistribute it and/or modify
@@ -18,10 +18,36 @@
 import types
 from instrument import Instrument
 import qt
-import comedi
 import logging
+from ctypes import cdll, c_int, c_char_p, byref, Structure, c_double, c_uint, POINTER
+from numpy import asarray, average, ndarray, zeros, float32
+
+comedi = cdll.LoadLibrary("libcomedi.so")
+
+class comedi_range(Structure):
+    _fields_ = [("min", c_double),
+                ("max", c_double),
+                ("unit", c_uint)]
+
+lsampl_t = c_uint
+
+comedi.comedi_get_range.restype = POINTER(comedi_range)
+comedi.comedi_get_board_name.restype = c_char_p
+comedi.comedi_to_phys.restype = c_double
+comedi.comedi_from_phys.restype = lsampl_t
 
 class USB_DUX(Instrument):
+    '''
+    Class implementing the USB_DUX instrument
+
+    The USB-DUX-D operated using the comedi driver has 5 subdevices:
+        0 : analog input    8 channels  12 bits
+        1 : analog output   4 channels  12 bits
+        2 : digital I/O     8 channels
+        3 : counter         4 channels  max value 65535
+        4 : pwm             8 channels  max value 512
+
+    '''
 
     def __init__(self, name, id):
         Instrument.__init__(self, name, tags=['physical'])
@@ -36,120 +62,104 @@ class USB_DUX(Instrument):
             self._nchannels.append(comedi.comedi_get_n_channels(self._device, subdevice))
         print self._nchannels
 
-        print comedi.comedi_get_range(self._device, 0, 0, 0)
-
         if self._device is None:
             logging.warning('USB_DUX not created successfully')
 
         for ch_in in range(self._nchannels[0]):
+            # get the first range for the channels, should be [-4.096, 4.096]
             range_struct = comedi.comedi_get_range(self._device, 0, ch_in, 0)
-            self.add_parameter(('input_%i'%ch_in),
+            self.add_parameter(('ai%i'%ch_in),
                 flags=Instrument.FLAG_GET,
-                type=types.IntType,
+                type=ndarray,
                 units='V',
                 tags=['measure'],
                 get_func=self.do_get_input,
                 channel=ch_in,
-                minval=range_struct.min,
-                maxval=range_struct.max)
+                minval=range_struct.contents.min,
+                maxval=range_struct.contents.max
+                )
 
         for ch_in in range(self._nchannels[1]):
+            # get the first range for the channels, should be [-4.096, 4.096]
             range_struct = comedi.comedi_get_range(self._device, 1, ch_in, 0)
-            self.add_parameter(('output_bipolar_%i'%ch_in),
-                flags=Instrument.FLAG_GET,
-                type=types.IntType,
+            self.add_parameter(('ao%i'%ch_in),
+                flags=Instrument.FLAG_GETSET,
+                type=types.FloatType,
                 units='V',
                 tags=['measure'],
-                get_func=self.do_get_output_unipolar,
+                get_func=self.do_get_output,
+                set_func=self.do_set_output,
                 channel=ch_in,
-                minval=range_struct.min,
-                maxval=range_struct.max)
+                minval=range_struct.contents.min,
+                maxval=range_struct.contents.max
+                )
 
-        for ch_in in range(self._nchannels[3]):
-            range_struct = comedi.comedi_get_range(self._device, 3, ch_in, 0)
-            self.add_parameter(('output_unipolar_%i'%ch_in),
-                flags=Instrument.FLAG_GET,
-                type=types.IntType,
-                units='V',
-                tags=['measure'],
-                get_func=self.do_get_output_bipolar,
-                channel=ch_in,
-                minval=range_struct.min,
-                maxval=range_struct.max)
+        self._default_input_range = comedi.comedi_get_range(self._device, 0, 0, 0)
+        self._default_input_maxdata = lsampl_t(4095)
 
-    def do_get_input(self, channel):
-        rc, raw_data = comedi.comedi_data_read(self._device, 0, channel, 0, 0)
+        self._default_output_range = comedi.comedi_get_range(self._device, 1, 0, 0)
+        self._default_output_maxdata = lsampl_t(4095)
+
+        self.get_all()
+
+    def do_get_input(self, channel, samples=1, averaged=False):
+        '''Get the value of the analog input'''
+        if samples == 1:
+            raw_data = c_uint()
+            rc = comedi.comedi_data_read(self._device, 
+                                                0, channel, 0, 0,
+                                                byref(raw_data))
+            data = comedi.comedi_to_phys(lsample_t(raw_data.value),
+                                    self._default_input_range,
+                                    self._default_input_maxdata)
+        elif samples > 1:
+            raw_data_type = c_uint * samples
+            raw_data = raw_data_type()
+            rc = comedi.comedi_data_read_n(self._device,
+                                                0, channel, 0, 0, 
+                                                byref(raw_data),
+                                                samples)
+            # make a numpy array from the c array
+            if rc == 0: # success
+                data = zeros((samples),dtype=float32)
+                for idx, value in enumerate(raw_data):
+                    data[idx] = comedi.comedi_to_phys(value,
+                                        self._default_input_range,
+                                        self._default_input_maxdata)
+                if averaged:
+                    return average(data)
+            else:
+                logging.warning('Reading of multiple samples failed.')
+                return False
+        else:
+            logging.warning('Invalid number of samples requested')
+            return False
         return data
 
-    def do_get_output(self, subdevice, channel):
-        rc, data = comedi.comedi_data_read(self._device, 1, channel, 0, 0)
-        return data
+    def do_get_output(self, channel):
+        raw_data = c_uint()
+        rc = comedi.comedi_data_read(self._device, 1, channel, 0, 0,
+                                                byref(raw_data))
+        data = comedi.comedi_to_phys(lsample_t(raw_data.value),
+                                    self._default_output_range,
+                                    self._default_output_maxdata)
+        return float(data)
 
-    def do_get_output_bipolar(self, channel):
-        rc, data = comedi.comedi_data_read(self._device, 1, channel, 0, 0)
-        return data
-
-    def do_get_output_unipolar(self, channel):
-        rc, data = comedi.comedi_data_read(self._device, 3, channel, 0, 0)
-        return data
+    def do_set_output(self, output_value, channel):
+        '''Set the output of an analog channel'''
+        set_value = comedi.comedi_from_phys(c_double(output_value),
+                                    self._default_output_range,
+                                    self._default_output_maxdata)             
+        rc = comedi.comedi_data_write(self._device, 1, channel, 0, 0, set_value)
+        if rc == 1: 
+            return True
+        else:
+            return False
         
-#    def get_all(self):
-#        ch_in = [_get_channel(ch) for ch in self._get_input_channels()]
-#        self.get(ch_in)
 
-#    def reset(self):
-#        '''Reset device.'''
-#        nidaq.reset_device(self._id)
-
-#    def _get_input_channels(self):
-#        return nidaq.get_physical_input_channels(self._id)
-
-#    def _get_output_channels(self):
-#        return nidaq.get_physical_output_channels(self._id)
-
-#    def _get_counter_channels(self):
-#        return nidaq.get_physical_counter_channels(self._id)
-
-#    def do_get_input(self, channel):
-#        devchan = '%s/%s' % (self._id, channel)
-#        return nidaq.read(devchan, config=self._chan_config)
-
-#    def do_set_output(self, val, channel):
-#        devchan = '%s/%s' % (self._id, channel)
-#        return nidaq.write(devchan, val)
-
-#    def do_set_chan_config(self, val):
-#        self._chan_config = val
-
-#    def do_set_count_time(self, val):
-#        self._count_time = val
-
-#    def do_get_counter(self, channel):
-#        devchan = '%s/%s' % (self._id, channel)
-#        src = self.get(channel + "_src")
-#        if src is not None and src != '':
-#            src = '/%s/%s' % (self._id, src)
-#        return nidaq.read_counter(devchan, src=src, freq=1/self._count_time)
-
-#    def read_counters(self, channels):
-#        chans = []
-#        srcs = []
-#        for chan in channels:
-#            chans.append('%s/%s' % (self._id, chan))
-#            srcs.append(self.get(chan + "_src"))
-#        return nidaq.read_counters(chans, src=srcs, freq=1.0/self._count_time)
-
-#    # Dummy
-#    def do_set_counter_src(self, val, channel):
-#        return True
-#
-#    def digital_out(self, lines, val):
-#        devchan = '%s/%s' % (self._id, lines)
-#        return nidaq.write_dig_port8(devchan, val)
-
-#def detect_instruments():
-#    '''Refresh NI DAQ instrument list.'''
-#
-#    for name in nidaq.get_device_names():
-#        qt.instruments.create('NI%s' % name, 'NI_DAQ', id=name)
-
+        
+    def get_all(self):
+        ch_in = ['ai0','ai1','ai2','ai3','ai4','ai5','ai6','ai7']
+        self.get(ch_in)
+        ch_out = ['ao0','ao1','ao2','ao3']
+        self.get(ch_out)
